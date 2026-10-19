@@ -1,0 +1,17 @@
+[project]
+name = "easy-office"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "jieba>=0.42.1",
+    "pydantic>=2.7",
+    "pytest>=8.0",
+    "pyyaml>=6.0",
+    "sqlite-vec>=0.1.6",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Runtime data and test caches
+data/
+.pytest_cache/
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+
+.claude
