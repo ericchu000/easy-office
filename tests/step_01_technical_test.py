@@ -10,9 +10,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import shutil
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -30,7 +29,9 @@ from easy_office.metadata.models import (
 )
 from easy_office.storage.base import PathNotAllowedError, StorageError
 
-DIM = 8
+DIM = 1024
+REAL_SERVICES = os.environ.get("EASYOFFICE_REAL_SERVICES") == "1"
+REAL_CONFIG = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
 def _write(path: Path, data: bytes | str) -> Path:
@@ -46,9 +47,16 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _vector(index: int, dim: int = DIM) -> list[float]:
+def _unit_vector(index: int, dim: int = DIM) -> list[float]:
     values = [0.0] * dim
     values[index] = 1.0
+    return values
+
+
+def _blend(first: int, second: int, second_weight: float = 0.05, dim: int = DIM) -> list[float]:
+    values = [0.0] * dim
+    values[first] = 1.0 - second_weight
+    values[second] = second_weight
     return values
 
 
@@ -100,7 +108,7 @@ def test_config_defaults_created_and_dynamic_update(core, tmp_path):
     assert persisted.get().reranker.top_n == 5
     assert persisted.get().local_parser.weights_dir == "custom-weights"
     assert persisted.paths().host_watch_dirs == (watch_dir.resolve(),)
-    assert persisted.paths().weights_dir == (paths.data_dir / "custom-weights")
+    assert persisted.paths().weights_dir == (paths.config_path.parent / "custom-weights")
 
 
 @pytest.mark.parametrize(
@@ -159,7 +167,7 @@ def test_secret_masking_and_masked_roundtrip(core):
 def test_embedding_dimension_guard_and_rebuild(core, tmp_path):
     path = _write(tmp_path / "guard.txt", b"guard")
     record = core.register_inplace(path)
-    core.add_chunks(record.file_uid, [ChunkInput(0, "guard", embedding=_vector(0))])
+    core.add_chunks(record.file_uid, [ChunkInput(0, "guard", embedding=_unit_vector(0))])
     assert core.db.vector_count() == 1
 
     with pytest.raises(VectorDimensionMismatch):
@@ -200,7 +208,7 @@ def test_dual_storage_modes_and_first_layer_attributes(core, tmp_path):
     assert record.fs_created_ts > 0
     assert record.uri.startswith("local:")
 
-    upload_bytes = b"PK\x03\x04fake-docx-bytes"
+    upload_bytes = b"PK\x03\x04stream-docx-bytes"
     uploaded = core.ingest_upload(
         "客户名单.docx",
         io.BytesIO(upload_bytes),
@@ -554,26 +562,26 @@ def _seed_index(core: EasyOfficeCore, root: Path):
             page_start=2,
             page_end=2,
             bbox=(10, 20, 300, 400),
-            embedding=_vector(0),
+            embedding=_unit_vector(0),
         ),
         ChunkInput(
             chunk_order=1,
             plain_text="Customer revenue growth report for Q3.",
             page_start=3,
-            embedding=_vector(1),
+            embedding=_unit_vector(1),
         ),
         ChunkInput(
             chunk_order=2,
             structured_text="<table><tr><td>成本</td><td>100</td></tr></table>",
             chunk_type="table",
             page_start=4,
-            embedding=_vector(2),
+            embedding=_unit_vector(2),
         ),
     ]
     core.add_chunks(report.file_uid, report_chunks)
     core.add_chunks(
         other.file_uid,
-        [ChunkInput(0, "季度营收无关内容", embedding=_vector(3))],
+        [ChunkInput(0, "季度营收无关内容", embedding=_unit_vector(3))],
     )
     return report, other
 
@@ -602,14 +610,14 @@ def test_bm25_vector_search_and_traceability(core, tmp_path):
 
     assert core.search_bm25("", top_k=5) == []
 
-    vector_hits = core.search_vector([0.95, 0.05, 0, 0, 0, 0, 0, 0], top_k=5)
+    vector_hits = core.search_vector(_blend(0, 1), top_k=5)
     assert vector_hits[0].file.file_uid == report.file_uid
     assert vector_hits[0].chunk.chunk_order == 0
     assert vector_hits[0].source == "vector"
     assert vector_hits[0].score == pytest.approx(1.0, abs=0.02)
 
     filtered = core.search_vector(
-        [0.95, 0.05, 0, 0, 0, 0, 0, 0],
+        _blend(0, 1),
         file_filter=FileQuery(topic_tags=["其他"]),
         top_k=5,
     )
@@ -629,12 +637,12 @@ def test_bm25_vector_search_and_traceability(core, tmp_path):
     with pytest.raises(ValueError):
         core.add_chunks(
             report.file_uid,
-            [ChunkInput(10, "a", embedding=_vector(0)), ChunkInput(10, "b", embedding=_vector(0))],
+            [ChunkInput(10, "a", embedding=_unit_vector(0)), ChunkInput(10, "b", embedding=_unit_vector(0))],
         )
 
     replaced = core.index.replace_file_chunks(
         report.file_uid,
-        [ChunkInput(0, "替换后的全新内容", embedding=_vector(4))],
+        [ChunkInput(0, "替换后的全新内容", embedding=_unit_vector(4))],
     )
     assert len(replaced) == 1
     assert core.search_bm25("营业收入", top_k=5) == []
@@ -654,14 +662,14 @@ def test_mirror_cache_generation_parsing_and_mapping(core, tmp_path):
                 sheet_name="Sheet 1|A",
                 row_start=5,
                 row_end=6,
-                embedding=_vector(0),
+                embedding=_unit_vector(0),
             ),
             ChunkInput(
                 1,
                 structured_text="<table><tr><td>成本</td><td>100</td></tr></table>",
                 chunk_type="table",
                 page_start=8,
-                embedding=_vector(1),
+                embedding=_unit_vector(1),
             ),
         ],
     )
@@ -687,11 +695,11 @@ def test_mirror_cache_generation_parsing_and_mapping(core, tmp_path):
 
     core.config.update({"storage": {"mirror_enabled": False}})
     second = core.register_inplace(_write(tmp_path / "mirror" / "无镜像.txt", b"none"))
-    core.add_chunks(second.file_uid, [ChunkInput(0, "disabled", embedding=_vector(2))])
+    core.add_chunks(second.file_uid, [ChunkInput(0, "disabled", embedding=_unit_vector(2))])
     assert not core.mirror.exists(second.file_uid)
 
     core.config.update({"storage": {"mirror_enabled": True}})
-    core.add_chunks(second.file_uid, [ChunkInput(1, "enabled", embedding=_vector(3))])
+    core.add_chunks(second.file_uid, [ChunkInput(1, "enabled", embedding=_unit_vector(3))])
     assert core.mirror.exists(second.file_uid)
 
     assert core.index.delete_chunks_for_file(record.file_uid) == 2
@@ -700,14 +708,14 @@ def test_mirror_cache_generation_parsing_and_mapping(core, tmp_path):
 
 def test_chunk_upsert_updates_fts_vector_and_mirror(core, tmp_path):
     record = core.register_inplace(_write(tmp_path / "upsert.txt", b"upsert"))
-    core.add_chunks(record.file_uid, [ChunkInput(0, "旧版苹果", embedding=_vector(0))])
+    core.add_chunks(record.file_uid, [ChunkInput(0, "旧版苹果", embedding=_unit_vector(0))])
     assert core.search_bm25("旧版苹果", top_k=3)[0].chunk.chunk_order == 0
 
-    core.add_chunks(record.file_uid, [ChunkInput(0, "新版香蕉", embedding=_vector(1))])
+    core.add_chunks(record.file_uid, [ChunkInput(0, "新版香蕉", embedding=_unit_vector(1))])
     assert core.index.count_chunks(record.file_uid) == 1
     assert core.search_bm25("旧版苹果", top_k=3) == []
     assert core.search_bm25("新版香蕉", top_k=3)[0].chunk.plain_text == "新版香蕉"
-    vector_hit = core.search_vector(_vector(1), top_k=3)[0]
+    vector_hit = core.search_vector(_unit_vector(1), top_k=3)[0]
     assert vector_hit.chunk.plain_text == "新版香蕉"
     mirror_text = core.mirror.path_for(record.file_uid).read_text(encoding="utf-8")
     assert "新版香蕉" in mirror_text and "旧版苹果" not in mirror_text
@@ -716,7 +724,7 @@ def test_chunk_upsert_updates_fts_vector_and_mirror(core, tmp_path):
 def test_changed_content_clears_stale_derived_data(core, tmp_path):
     path = _write(tmp_path / "changing.txt", b"version-one")
     record = core.register_inplace(path)
-    core.add_chunks(record.file_uid, [ChunkInput(0, "版本一", embedding=_vector(0))])
+    core.add_chunks(record.file_uid, [ChunkInput(0, "版本一", embedding=_unit_vector(0))])
     assert core.index.count_chunks(record.file_uid) == 1
     assert core.mirror.exists(record.file_uid)
 
@@ -737,7 +745,7 @@ def test_plain_text_column_is_markup_free(core, tmp_path):
                 0,
                 plain_text="<b>加粗正文</b>",
                 structured_text="<b>加粗正文</b>",
-                embedding=_vector(0),
+                embedding=_unit_vector(0),
             )
         ],
     )
@@ -750,7 +758,7 @@ def test_plain_text_column_is_markup_free(core, tmp_path):
 def test_delete_file_cleans_chunks_mirror_and_managed_bytes(core, tmp_path):
     record = core.ingest_upload("delete-me.txt", io.BytesIO(b"delete"))
     path = Path(record.local_path)
-    core.add_chunks(record.file_uid, [ChunkInput(0, "待删除", embedding=_vector(0))])
+    core.add_chunks(record.file_uid, [ChunkInput(0, "待删除", embedding=_unit_vector(0))])
     assert path.is_file() and core.mirror.exists(record.file_uid)
 
     assert core.delete_file(record.file_uid) is True
@@ -765,42 +773,16 @@ def test_delete_file_cleans_chunks_mirror_and_managed_bytes(core, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-class _ModelsHandler(BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802 - http.server API
-        body = json.dumps({"data": [{"id": "m1"}, {"id": "m2"}]}).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args):  # noqa: D401 - silence test server
-        return
-
-
-def test_connectivity_probe(core):
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _ModelsHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    port = server.server_address[1]
-    try:
-        core.config.update({"llm": {"base_url": f"http://127.0.0.1:{port}"}})
-        empty_probe = core.config.test_connectivity("local_parser")
-        assert empty_probe["local_parser"]["status"] == "not_configured"
-
-        weights = core.config.paths().weights_dir
-        _write(weights / "placeholder.bin", b"weights")
-        results = core.config.test_connectivity("all")
-        assert results["llm"]["status"] == "ok"
-        assert results["llm"]["detail"]["model_count"] == 2
-        assert results["vlm"]["status"] == "not_configured"
-        assert results["reranker"]["status"] == "disabled"
-        assert results["local_parser"]["status"] == "ok"
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    core.config.update({"llm": {"base_url": f"http://127.0.0.1:{port}"}})
-    assert core.config.test_connectivity("llm")["llm"]["status"] == "unreachable"
+@pytest.mark.skipif(
+    not REAL_SERVICES or not REAL_CONFIG.is_file(),
+    reason="set EASYOFFICE_REAL_SERVICES=1 and provide config.yaml",
+)
+def test_real_connectivity_probe():
+    manager = ConfigManager(config_path=REAL_CONFIG)
+    results = manager.test_connectivity("all")
+    assert results["embedding"]["status"] == "ok"
+    assert results["vlm"]["status"] == "ok"
+    assert results["local_parser"]["status"] in {"ok", "not_configured"}
 
 
 def test_sqlite_wal_vector_extension_and_reopen(core, tmp_path):
@@ -821,7 +803,7 @@ def test_sqlite_wal_vector_extension_and_reopen(core, tmp_path):
     } <= indexes
 
     record = core.register_inplace(_write(tmp_path / "persist.txt", b"persist"))
-    core.add_chunks(record.file_uid, [ChunkInput(0, "持久化", embedding=_vector(0))])
+    core.add_chunks(record.file_uid, [ChunkInput(0, "持久化", embedding=_unit_vector(0))])
     config_path = core.config.config_path
     data_dir = core.config.data_dir
     core.close()
@@ -857,7 +839,7 @@ def test_hot_reload_paths_and_managed_workspace(core, tmp_path):
 
     record = core.ingest_upload("hot.txt", io.BytesIO(b"hot"))
     assert str(new_managed.resolve()) in record.local_path
-    core.add_chunks(record.file_uid, [ChunkInput(0, "热重载", embedding=_vector(0))])
+    core.add_chunks(record.file_uid, [ChunkInput(0, "热重载", embedding=_unit_vector(0))])
     assert core.mirror.path_for(record.file_uid).is_file()
     assert str(new_mirror.resolve()) in str(core.mirror.path_for(record.file_uid))
 

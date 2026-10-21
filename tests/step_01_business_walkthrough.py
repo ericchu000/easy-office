@@ -1,22 +1,37 @@
-"""Step 1 business walkthrough (human-review tier).
+"""Step 1 business walkthrough using real documents and real model services.
 
-This script tells one continuous story from a user's perspective: configure the
-assistant, register a host folder file, receive a browser upload, backfill the
-two metadata layers, filter files, index chunks, search them, inspect the
-plain-text mirror, and finally archive a file while keeping metadata in sync.
+The script tells one continuous user story with the files the user actually
+provided: configure the assistant, register a real host file, receive a real
+browser upload, run the real Step 2 parser (Docling/RapidOCR/VLM), backfill
+metadata, derive real table/image records from the parsed output, run BM25 and
+real Embedding vector search, inspect the companion mirror, and archive a file
+while keeping the database path in sync.
+
+No file bytes or vectors are fabricated. The only generated files are a CSV
+and a PNG copied from the parsed real document, used to demonstrate the table
+and image modality-summary APIs.
 
 Run from the project root::
 
-    .venv\\Scripts\\python.exe tests\\step_01_business_walkthrough.py
+    .venv\\Scripts\\python.exe tests\\step_01_business_walkthrough.py data
 
-Add ``--keep`` to keep the temporary working directory and inspect the database
-and mirror files afterwards.
+Options:
+    data                  directory containing real DOCX/PDF/PPTX/DOC/PPT files
+    --data-dir PATH       runtime data directory (default: temporary)
+    --inplace PATH        real file registered in place (default: first DOCX)
+    --upload PATH         real file streamed through managed upload (default: first PDF)
+    --query TEXT          real search query (default: 功率预测)
+    --keep                keep the temporary runtime directory
+
+The script requires the project-root ``config.yaml`` with a configured Embedding service
+and a configured VLM (the same ones used by Step 2). It exits non-zero if the
+services or the Docling weights are missing.
 """
 
 from __future__ import annotations
 
 import argparse
-import io
+import csv
 import json
 import shutil
 import sys
@@ -29,8 +44,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from easy_office.config.manager import ConfigValidationError
 from easy_office.core import EasyOfficeCore
-from easy_office.indexing.base import ChunkInput
 from easy_office.metadata.models import FileQuery
+from easy_office.models.services import build_embedding_client
+
+SUPPORTED = {".docx", ".pdf", ".pptx", ".doc", ".ppt"}
 
 
 def banner(title: str) -> None:
@@ -55,298 +72,333 @@ def describe_record(record) -> None:
     )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Step 1 业务链路演示")
-    parser.add_argument("--keep", action="store_true", help="保留临时工作目录")
-    args = parser.parse_args()
+def _pick_document(docs_dir: Path, extension: str, exclude: set[Path] | None = None) -> Path:
+    exclude = exclude or set()
+    for path in sorted(docs_dir.rglob(f"*{extension}")):
+        if path.is_file() and not path.name.startswith("~$") and path not in exclude:
+            return path
+    raise SystemExit(f"未在 {docs_dir} 找到真实 {extension} 文档")
 
-    try:  # Make Chinese output readable in Windows terminals.
+
+def _pick_digital_pdf(docs_dir: Path, exclude: set[Path] | None = None) -> Path:
+    """Prefer a PDF with a real native-text layer for the fast business path."""
+    exclude = exclude or set()
+    pdfs = [
+        path
+        for path in sorted(docs_dir.rglob("*.pdf"))
+        if path.is_file() and not path.name.startswith("~$") and path not in exclude
+    ]
+    if not pdfs:
+        raise SystemExit(f"未在 {docs_dir} 找到真实 PDF 文档")
+    try:
+        from easy_office.parsing.pdf_probe import probe_pdf
+
+        for path in pdfs:
+            if any(not page.is_scanned for page in probe_pdf(path)):
+                return path
+    except Exception:
+        pass
+    return pdfs[0]
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Step 1 真实业务链路演示")
+    parser.add_argument("docs", nargs="?", default=str(PROJECT_ROOT / "data"),
+                        help="真实文档目录（默认 data）")
+    parser.add_argument("--data-dir", default="", help="运行数据目录（默认临时目录）")
+    parser.add_argument("--inplace", default="", help="原地引用模式使用的真实文件")
+    parser.add_argument("--upload", default="", help="托管上传模式使用的真实文件")
+    parser.add_argument("--query", default="功率预测", help="真实检索查询")
+    parser.add_argument("--keep", action="store_true", help="保留临时数据目录")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+    try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
-    root = Path(tempfile.mkdtemp(prefix="easyoffice-step01-"))
+    docs_dir = Path(args.docs).expanduser().resolve()
+    config_path = PROJECT_ROOT / "config.yaml"
+    weights_dir = PROJECT_ROOT / "models"
+    if not config_path.is_file():
+        print(f"[失败] 缺少真实模型配置文件：{config_path}", file=sys.stderr)
+        return 1
+    if not weights_dir.is_dir() or not any(weights_dir.iterdir()):
+        print(f"[失败] 缺少 Docling 权重目录：{weights_dir}", file=sys.stderr)
+        return 1
+    if not docs_dir.is_dir():
+        print(f"[失败] 文档目录不存在：{docs_dir}", file=sys.stderr)
+        return 1
+
+    root = Path(tempfile.mkdtemp(prefix="easyoffice-step01-real-"))
     host_dir = root / "宿主文件夹"
     host_dir.mkdir(parents=True)
+    runtime_dir = Path(args.data_dir).expanduser().resolve() if args.data_dir else root / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    inplace_source = (
+        Path(args.inplace).expanduser().resolve()
+        if args.inplace
+        else _pick_document(docs_dir, ".docx")
+    )
+    upload_source = (
+        Path(args.upload).expanduser().resolve()
+        if args.upload
+        else _pick_digital_pdf(docs_dir, exclude={inplace_source})
+    )
+    if upload_source == inplace_source:
+        raise SystemExit("--inplace 与 --upload 不能是同一文件")
+
     core = EasyOfficeCore.bootstrap(
-        config_path=root / "config.yaml",
-        data_dir=root / "data",
-        config_patch={"embedding": {"embedding_dim": 8}},
+        config_path=config_path,
+        data_dir=runtime_dir,
+        config_patch={
+            "local_parser": {"weights_dir": str(weights_dir)},
+            "storage": {"managed_workspace": str(root / "managed_src_files")},
+        },
+        persist_patch=False,
     )
 
     try:
-        banner("步骤 1：初始化配置中心与本地存储")
+        banner("步骤 1：加载真实配置与本地存储")
         paths = core.config.paths()
-        print(f"  数据目录：{paths.data_dir}")
-        print(f"  配置文件：{paths.config_path}")
+        print(f"  真实配置：{config_path}")
+        print(f"  运行目录：{paths.data_dir}")
         print(f"  索引数据库：{paths.index_db_path}")
         print(f"  托管工作区：{paths.managed_workspace}")
         print(f"  伴生镜像目录：{paths.mirror_dir}")
-        check(paths.config_path.is_file(), "默认配置文件已自动生成")
-        check(paths.index_db_path.is_file(), "SQLite 索引数据库已创建")
+        print(f"  资产缓存目录：{paths.asset_cache_dir}")
+        print(f"  原地引用文档：{inplace_source}")
+        print(f"  托管上传文档：{upload_source}")
+        check(paths.index_db_path.is_file(), "真实配置已加载，SQLite 索引数据库已创建")
 
-        banner("步骤 2：在线修改 LLM 配置，观察热重载与密钥脱敏")
+        embedding_client = build_embedding_client(core.config.get().embedding)
+        vlm_config = core.config.get().vlm
+        check(embedding_client is not None, "真实 Embedding 服务已配置")
+        check(bool(vlm_config.base_url and vlm_config.model_name), "真实 VLM 服务已配置")
+
+        banner("步骤 2：在线修改 LLM 温度，观察热重载与真实密钥脱敏")
         observed = []
-        core.config.subscribe(lambda cfg: observed.append(cfg.llm.model_name))
-        core.config.update(
-            {
-                "llm": {
-                    "base_url": "http://127.0.0.1:11434/v1",
-                    "model_name": "qwen2.5-7b-instruct",
-                    "api_key": "sk-demo-secret",
-                    "temperature": 0.3,
-                }
-            }
+        core.config.subscribe(lambda cfg: observed.append(cfg.llm.temperature))
+        original = core.config.get().llm.temperature
+        updated = 0.25 if abs(original - 0.25) > 1e-9 else 0.3
+        core.config.set("llm.temperature", updated, persist=False)
+        check(
+            observed == [updated],
+            f"配置变更已触发热重载通知（temperature {original} → {updated}）",
         )
-        check(observed == ["qwen2.5-7b-instruct"], "配置变更已触发热重载通知")
         public_llm = core.config.public_config()["llm"]
-        print("  脱敏后的 LLM 配置：")
-        print(json.dumps(public_llm, ensure_ascii=False, indent=2))
-        check(public_llm["api_key"] == "********", "API 密钥已脱敏展示")
+        if core.config.get().llm.api_key.get_secret_value():
+            check(public_llm["api_key"] == "********", "真实 LLM 密钥在公开视图中已脱敏")
+        else:
+            print("  LLM 未配置密钥，跳过脱敏断言（Embedding/VLM 密钥仍按同一机制处理）")
+        core.config.set("llm.temperature", original, persist=False)
+
+        banner("步骤 3：宿主机原地引用模式登记真实文档")
+        local_copy = host_dir / inplace_source.name
+        shutil.copy2(inplace_source, local_copy)
+        record = core.register_inplace(local_copy)
+        describe_record(record)
+        check(record.storage_mode == "inplace", "真实文档以宿主机原地引用模式登记")
+        check(record.content_hash and len(record.content_hash) == 64, "SHA-256 已计算")
+        check(record.size_bytes == local_copy.stat().st_size, "文件大小采集准确")
         check(
-            "sk-demo-secret" in paths.config_path.read_text(encoding="utf-8"),
-            "真实密钥已安全持久化到本地 YAML",
+            not (core.storage.managed_workspace / record.file_uid).exists(),
+            "原地引用模式没有复制任何文件",
         )
 
-        banner("步骤 3：宿主机原地引用模式注册存量文件")
-        report_path = host_dir / "季度经营分析.docx"
-        report_path.write_text(
-            "第三季度营业收入同比增长百分之二十，毛利率提升。", encoding="utf-8"
-        )
-        report = core.register_inplace(report_path)
-        describe_record(report)
-        check(report.storage_mode == "inplace", "文件以宿主机原地引用模式登记")
-        check(report.content_hash and len(report.content_hash) == 64, "SHA-256 已计算")
-        check(report.size_bytes == report_path.stat().st_size, "文件大小采集准确")
-        check(not (core.storage.managed_workspace / report.file_uid).exists(),
-              "原地引用模式没有复制任何文件")
-
-        banner("步骤 4：跨端上传托管归档模式接收浏览器上传")
-        csv_bytes = "姓名,电话,区域\n张三,13800000000,华东\n".encode("utf-8")
-        customers = core.ingest_upload(
-            "客户回访名单.csv",
-            io.BytesIO(csv_bytes),
-            fs_created_at="2024-06-01T09:00:00+08:00",
-            fs_modified_at="2024-06-02T10:00:00+08:00",
-        )
-        photo = core.ingest_upload("会议照片.png", io.BytesIO(b"\x89PNG\r\n\x1a\nfake"))
-        describe_record(customers)
-        check(customers.storage_mode == "managed", "上传文件进入托管归档模式")
+        banner("步骤 4：跨端上传托管归档模式接收真实文件流")
+        with open(upload_source, "rb") as handle:
+            uploaded = core.ingest_upload(upload_source.name, handle)
+        describe_record(uploaded)
+        check(uploaded.storage_mode == "managed", "真实文件流进入托管归档模式")
         check(
-            str(core.storage.managed_workspace) in customers.local_path,
+            str(core.storage.managed_workspace) in uploaded.local_path,
             "托管文件物理存放在托管工作区",
         )
-        check(Path(customers.local_path).read_bytes() == csv_bytes, "上传字节完整落盘")
-        check(photo.extension == "png", "图片 MIME/扩展名识别正确")
+        check(
+            Path(uploaded.local_path).read_bytes() == upload_source.read_bytes(),
+            "上传字节与真实源文件完全一致",
+        )
 
-        banner("步骤 5：回填第二层语义元数据与三类模态专属结构摘要")
+        banner("步骤 5：真实解析、切片、Embedding 与办公结构摘要")
+        inplace_result = core.office.ingest(record.file_uid)
+        upload_result = core.office.ingest(uploaded.file_uid)
+        print(
+            f"  原地文档：{inplace_result.source_format}  {inplace_result.page_count} 页  "
+            f"{inplace_result.chunk_count} 切片  {inplace_result.embedded_chunk_count} 向量"
+        )
+        print(
+            f"  上传文档：{upload_result.source_format}  {upload_result.page_count} 页  "
+            f"{upload_result.chunk_count} 切片  {upload_result.embedded_chunk_count} 向量"
+        )
+        check(inplace_result.chunk_count > 0, "真实文档已产生可检索切片")
+        check(
+            inplace_result.embedded_chunk_count == inplace_result.chunk_count,
+            "所有切片均由真实 Embedding 服务向量化",
+        )
+        check(
+            upload_result.embedded_chunk_count == upload_result.chunk_count,
+            "上传文档的所有切片均已向量化",
+        )
+
+        banner("步骤 6：回填真实语义元数据与三类模态专属摘要")
+        first_text = next(
+            (chunk.plain_text for chunk in core.index.get_chunks(record.file_uid)
+             if chunk.chunk_type == "text" and chunk.plain_text.strip()),
+            "",
+        )
+        summary_text = " ".join(first_text.split())[:120]
         core.metadata.update_semantic_metadata(
-            report.file_uid,
-            topic_tags=["财务", "年度报告"],
-            summary="季度经营分析，营业收入与毛利率保持增长。",
-            entities=["甲公司", "财务部"],
-            keywords=["营业收入", "毛利率", "增长"],
-            business_start_date="2024-01-01",
+            record.file_uid,
+            topic_tags=["新能源", "功率预测"],
+            summary=summary_text or "真实文档解析内容",
+            entities=["风电", "光伏"],
+            keywords=["功率预测", "人工智能"],
+            business_start_date="2021-01-01",
             business_end_date="2024-12-31",
         )
-        core.metadata.update_modality_summary(
-            report.file_uid,
-            "office",
-            {
-                "document_carrier_type": "digital",
-                "page_count": 3,
-                "has_tables": True,
-                "has_images": True,
-            },
-        )
-        core.metadata.update_semantic_metadata(
-            customers.file_uid,
-            topic_tags=["财务", "业务数据表"],
-            summary="客户回访名单，包含联系方式与区域信息。",
-            keywords=["客户", "回访"],
-            business_start_date="2024-06-01",
-            business_end_date="2024-06-30",
-        )
-        core.metadata.update_modality_summary(
-            customers.file_uid,
-            "table",
-            {"column_names": ["姓名", "电话", "区域"], "row_count": 1},
-        )
-        core.metadata.update_semantic_metadata(
-            photo.file_uid,
-            topic_tags=["财务", "会议"],
-            summary="财务会议白板照片。",
-        )
-        core.metadata.update_modality_summary(
-            photo.file_uid,
-            "image",
-            {
-                "width": 1920,
-                "height": 1080,
-                "background_color": "白色",
-                "scene_category": "会议白板",
-                "visual_tags": ["人物", "白板", "会议室"],
-            },
-        )
-        refreshed = core.metadata.get_file(report.file_uid)
-        check(refreshed and refreshed.topic_tags == ["财务", "年度报告"], "语义标签已回填")
+        refreshed = core.metadata.get_file(record.file_uid)
+        check(refreshed and refreshed.topic_tags == ["新能源", "功率预测"], "真实语义标签已回填")
         check(
             refreshed and refreshed.modality_summary_kind == "office",
-            "办公文档专属结构摘要已挂接",
-        )
-        check(
-            core.metadata.get_file(customers.file_uid).modality_summary_kind == "table",
-            "表格专属结构摘要已挂接",
-        )
-        check(
-            core.metadata.get_file(photo.file_uid).modality_summary_kind == "image",
-            "图像专属结构摘要已挂接",
+            "办公文档专属结构摘要已由真实解析结果回填",
         )
 
-        banner("步骤 6：多条件复合初筛")
-        finance_docx = core.metadata.query_files(
+        # Derive a real table record from the parsed document (no fabricated rows).
+        table_chunks = [
+            chunk for chunk in core.index.get_chunks(record.file_uid)
+            if chunk.chunk_type == "table"
+        ]
+        if table_chunks:
+            chunk = table_chunks[0]
+            rows = []
+            for line in chunk.plain_text.splitlines():
+                if "|" not in line or line.startswith("[") or line.startswith("表头"):
+                    continue
+                values = [value.strip() for value in line.split("|")]
+                if not any(values):
+                    continue
+                rows.append(values)
+            if len(rows) >= 2:
+                csv_path = host_dir / "真实表格导出.csv"
+                with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+                    csv.writer(handle).writerows(rows)
+                table_record = core.register_inplace(csv_path)
+                table_summary = {
+                    "column_names": rows[0],
+                    "row_count": max(0, len(rows) - 1),
+                    "derived_from": record.file_name,
+                }
+                core.metadata.update_modality_summary(
+                    table_record.file_uid, "table", table_summary
+                )
+                check(
+                    core.metadata.get_file(table_record.file_uid).modality_summary_kind == "table",
+                    "表格专属结构摘要已用真实解析表格回填",
+                )
+
+        # Derive a real image record from a retained, VLM-described crop.
+        image_chunks = [
+            chunk for chunk in core.index.get_chunks(record.file_uid)
+            if chunk.chunk_type == "image" and chunk.image_path
+        ]
+        if image_chunks:
+            chunk = image_chunks[0]
+            image_path = Path(chunk.image_path)
+            if image_path.is_file():
+                image_copy = host_dir / "真实内嵌图片.png"
+                shutil.copy2(image_path, image_copy)
+                image_record = core.register_inplace(image_copy)
+                image_summary = {
+                    "width": chunk.metadata.get("image_width"),
+                    "height": chunk.metadata.get("image_height"),
+                    "visual_tags": chunk.metadata.get("visual_tags") or [],
+                    "description": chunk.plain_text.split("图片描述：", 1)[-1][:300],
+                    "derived_from": record.file_name,
+                }
+                core.metadata.update_modality_summary(
+                    image_record.file_uid, "image", image_summary
+                )
+                check(
+                    core.metadata.get_file(image_record.file_uid).modality_summary_kind == "image",
+                    "图像专属结构摘要已用真实 VLM 描述回填",
+                )
+
+        banner("步骤 7：多条件复合初筛")
+        matched = core.metadata.query_files(
             FileQuery(
-                topic_tags=["财务", "年度报告"],
-                require_all_topic_tags=True,
-                extensions=["docx"],
-                modality_filters={"has_tables": True},
-                business_start_from="2024-06-01",
-                business_end_to="2024-06-30",
+                topic_tags=["新能源"],
+                extensions=[inplace_result.source_format],
+                modality_kind="office",
             )
         )
-        print("  条件：主题同时包含财务+年度报告、扩展名 docx、含表格、业务时间与 2024-06 重叠")
-        print(f"  命中：{[item.file_name for item in finance_docx]}")
-        check([item.file_name for item in finance_docx] == ["季度经营分析.docx"],
-              "办公文档复合筛选准确")
-
-        white_images = core.metadata.query_files(
-            FileQuery(modality_kind="image", modality_filters={"background_color": "白色"})
-        )
-        check([item.file_name for item in white_images] == ["会议照片.png"],
-              "按图像背景颜色筛选准确")
-
-        column_tables = core.metadata.query_files(
-            FileQuery(modality_filters={"column_names": "区域"})
-        )
-        check([item.file_name for item in column_tables] == ["客户回访名单.csv"],
-              "按表头列名筛选准确")
-
-        banner("步骤 7：切片入库、BM25 全文检索与向量语义检索")
-        print("  说明：本步骤不调用真实嵌入模型，使用 8 维模拟向量验证存储与检索链路。")
-        core.add_chunks(
-            report.file_uid,
-            [
-                ChunkInput(
-                    0,
-                    "第三季度营业收入同比增长百分之二十，毛利率提升。",
-                    page_start=1,
-                    page_end=1,
-                    bbox=(40, 60, 520, 760),
-                    embedding=[1, 0, 0, 0, 0, 0, 0, 0],
-                ),
-                ChunkInput(
-                    1,
-                    "第四季度营业收入预计保持稳定。",
-                    page_start=2,
-                    embedding=[0, 1, 0, 0, 0, 0, 0, 0],
-                ),
-                ChunkInput(
-                    2,
-                    structured_text="<table><tr><td>项目</td><td>金额</td></tr>"
-                    "<tr><td>营业收入</td><td>1200</td></tr></table>",
-                    chunk_type="table",
-                    page_start=3,
-                    embedding=[0, 0, 1, 0, 0, 0, 0, 0],
-                ),
-            ],
-        )
-        core.add_chunks(
-            customers.file_uid,
-            [ChunkInput(0, "客户回访名单：姓名、电话、区域。", embedding=[0, 0, 0, 1, 0, 0, 0, 0])],
-        )
-        core.add_chunks(
-            photo.file_uid,
-            [ChunkInput(0, "会议白板照片，白色背景，人物讨论财务指标。", embedding=[0, 0, 0, 0, 1, 0, 0, 0])],
+        print(f"  命中：{[item.file_name for item in matched]}")
+        check(
+            any(item.file_uid == record.file_uid for item in matched),
+            "主题 + 扩展名 + 模态类型复合筛选命中真实文档",
         )
 
-        bm25_hits = core.search_bm25("营业收入 增长", top_k=3)
+        banner("步骤 8：真实 BM25 与真实 Embedding 向量检索")
+        bm25_hits = core.search_bm25(args.query, top_k=5)
+        print(f"  BM25 查询：{args.query}")
         for hit in bm25_hits:
             print(
-                f"  BM25 第{hit.rank}名 得分={hit.score:.4f} "
-                f"{hit.file.file_name} 第{hit.chunk.page_start}页：{hit.snippet}"
+                f"    第{hit.rank}名 得分={hit.score:.4f} {hit.file.file_name} "
+                f"第{hit.chunk.page_start}页 [{hit.chunk.chunk_type}] {hit.snippet[:80]}"
             )
-        check(
-            bm25_hits and bm25_hits[0].file.file_name == "季度经营分析.docx",
-            "BM25 中文检索命中经营分析文档",
-        )
-
-        vector_hits = core.search_vector(
-            [0.98, 0.02, 0, 0, 0, 0, 0, 0], top_k=3
-        )
+        check(bool(bm25_hits), "BM25 对真实文档返回检索结果")
+        query_vector = embedding_client.embed_query(args.query)
+        vector_hits = core.search_vector(query_vector, top_k=5)
+        print("  向量检索结果：")
         for hit in vector_hits:
             print(
-                f"  向量 第{hit.rank}名 余弦相似度={hit.score:.4f} "
-                f"{hit.file.file_name}：{hit.snippet}"
+                f"    第{hit.rank}名 余弦相似度={hit.score:.4f} {hit.file.file_name} "
+                f"第{hit.chunk.page_start}页 {hit.snippet[:80]}"
             )
-        check(
-            vector_hits and vector_hits[0].file.file_name == "季度经营分析.docx",
-            "向量近邻检索命中目标文档",
-        )
+        check(bool(vector_hits), "真实 Embedding 向量检索返回结果")
+        check(len(query_vector) == core.config.get().embedding.embedding_dim,
+              "查询向量维度与配置一致")
 
-        image_only = core.search_vector(
-            [0, 0, 0, 0.2, 0.98, 0, 0, 0],
-            file_filter=FileQuery(extensions=["png"]),
-            top_k=3,
-        )
-        check(
-            image_only and image_only[0].file.file_name == "会议照片.png",
-            "带元数据过滤的向量检索只返回图片",
-        )
-
-        banner("步骤 8：纯文本伴生镜像缓存")
-        mirror_path = core.mirror.path_for(report.file_uid)
+        banner("步骤 9：纯文本伴生镜像缓存")
+        mirror_path = core.mirror.path_for(record.file_uid)
         print(f"  镜像文件：{mirror_path}")
-        print("  前两行（每行带文件标识与页码前缀）：")
         for line in mirror_path.read_text(encoding="utf-8").splitlines()[:2]:
             print(f"  {line}")
-        check(mirror_path.is_file(), "伴生镜像文件已生成")
-        mirror_lines = core.mirror.read_lines(report.file_uid)
-        check(
-            mirror_lines and mirror_lines[0].page_start == 1,
-            "镜像行可解析回页码定位",
-        )
-        check(
-            not any("<td>" in item.text for item in mirror_lines),
-            "表格 HTML 标签未写入纯文本镜像",
-        )
+        check(mirror_path.is_file(), "真实文档的伴生镜像已生成")
+        check(not any("<td>" in line for line in mirror_path.read_text(encoding="utf-8").splitlines()),
+              "表格 HTML 标签未写入纯文本镜像")
 
-        banner("步骤 9：文件归档移动与 SHA-256 路径同步")
-        archive_dir = host_dir / "归档" / "财务"
+        banner("步骤 10：文件归档移动与 SHA-256 路径同步")
+        archive_dir = host_dir / "归档" / "新能源"
         archive_dir.mkdir(parents=True)
-        archived_path = archive_dir / "季度经营分析.docx"
+        archived_path = archive_dir / local_copy.name
         old_hash = refreshed.content_hash if refreshed else ""
-        shutil.move(str(report_path), str(archived_path))
-        archived = core.sync_moved_path(report.file_uid, archived_path)
-        print(f"  新路径：{archived.local_path}")
-        check(archived.file_uid == report.file_uid, "归档后文件唯一标识保持不变")
+        shutil.move(str(local_copy), str(archived_path))
+        archived = core.sync_moved_path(record.file_uid, archived_path)
+        check(archived.file_uid == record.file_uid, "归档后文件唯一标识保持不变")
         check(archived.content_hash == old_hash, "内容哈希保持不变")
         check(archived.local_path == str(archived_path.resolve()), "数据库路径已原地同步")
 
-        banner("步骤 10：非法配置拦截与最终脱敏视图")
+        banner("步骤 11：非法配置拦截与最终脱敏视图")
         try:
-            core.config.update({"llm": {"temperature": 3.5}})
+            core.config.update({"llm": {"temperature": 3.5}}, persist=False)
             raise AssertionError("非法温度没有被拦截")
         except ConfigValidationError as exc:
             print(f"  已拦截：{exc.errors[0]}")
             check(True, "非法配置被强类型校验拦截")
         check(
-            core.config.get().llm.temperature == 0.3,
+            abs(core.config.get().llm.temperature - original) < 1e-9,
             "被拒绝的配置没有污染运行中的配置中心",
         )
 
-        banner("演示完成")
-        print("  已覆盖：配置热更新与脱敏、双模式存储、两层元数据、三类模态摘要、")
-        print("           复合筛选、BM25/向量检索、伴生镜像、哈希路径同步。")
+        banner("演示完成（真实文档 + 真实模型）")
+        print("  已覆盖：真实配置热更新与脱敏、双模式存储、真实解析与向量化、")
+        print("           两层元数据、三类模态摘要、复合筛选、BM25/向量检索、")
+        print("           伴生镜像、SHA-256 路径同步。")
         if args.keep:
             print(f"\n  工作目录已保留：{root}")
         return 0
@@ -362,6 +414,6 @@ if __name__ == "__main__":
     except AssertionError as exc:
         print(f"\n[失败] {exc}", file=sys.stderr)
         raise SystemExit(1)
-    except Exception as exc:  # pragma: no cover - interactive script
+    except Exception as exc:
         print(f"\n[异常] {type(exc).__name__}: {exc}", file=sys.stderr)
         raise

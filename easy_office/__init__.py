@@ -1,8 +1,9 @@
 """Easy Office: local multimodal intelligent office assistant.
 
-This package currently exposes the Step 1 foundation: dynamic configuration,
-dual-mode file storage, layered metadata, and a SQLite hybrid index with a
-plain-text companion mirror cache.
+Implemented so far: the Step 1 foundation (configuration, dual-mode storage,
+layered metadata, hybrid index and mirror cache) and the Step 2 office
+document parsing pipeline (Docling, LibreOffice legacy conversion, PDF page
+routing, table/image processing, chunks and structure summaries).
 """
 
 from easy_office.core import EasyOfficeCore

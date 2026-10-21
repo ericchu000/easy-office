@@ -34,10 +34,10 @@ def core_factory(tmp_path):
         counter["n"] += 1
         base = tmp_path / f"case{counter['n']}"
         base.mkdir(parents=True, exist_ok=True)
-        merged = _deep_merge({"embedding": {"embedding_dim": 8}}, patch)
+        merged = _deep_merge({"embedding": {"embedding_dim": 1024}}, patch)
         core = EasyOfficeCore.bootstrap(
             config_path=base / "config.yaml",
-            data_dir=base / "data",
+            data_dir=base / "runtime",
             config_patch=merged,
         )
         cores.append(core)

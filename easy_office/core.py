@@ -14,6 +14,7 @@ from easy_office.indexing.mirror import MirrorCache
 from easy_office.indexing.sqlite_store import SQLiteHybridIndexStore
 from easy_office.metadata.models import FileQuery, FileRecord
 from easy_office.metadata.repository import MetadataStore
+from easy_office.parsing.assets import AssetCache
 from easy_office.storage.base import StorageMode, StorageError
 from easy_office.storage.local import LocalFileStorage
 
@@ -43,6 +44,7 @@ class EasyOfficeCore:
         metadata: MetadataStore,
         index: SQLiteHybridIndexStore,
         mirror: MirrorCache,
+        assets: AssetCache,
     ) -> None:
         self._config = config
         self._storage = storage
@@ -50,6 +52,8 @@ class EasyOfficeCore:
         self._metadata = metadata
         self._index = index
         self._mirror = mirror
+        self._assets = assets
+        self._office = None
         self._closed = False
         self._unsubscribe_config = config.subscribe(self._apply_config_change)
         self._remove_config_validator = config.add_validator(self._validate_config_change)
@@ -62,6 +66,7 @@ class EasyOfficeCore:
         data_dir: str | Path | None = None,
         *,
         config_patch: dict | None = None,
+        persist_patch: bool = True,
         create_if_missing: bool = True,
     ) -> "EasyOfficeCore":
         manager = ConfigManager(
@@ -70,7 +75,7 @@ class EasyOfficeCore:
             create_if_missing=create_if_missing,
         )
         if config_patch:
-            manager.update(config_patch)
+            manager.update(config_patch, persist=persist_patch)
         paths = manager.ensure_directories()
         config = manager.get()
         cls._assert_supported(config)
@@ -84,7 +89,8 @@ class EasyOfficeCore:
             paths.host_allowed_roots,
             max_upload_bytes=config.storage.max_upload_bytes,
         )
-        return cls(manager, storage, db, metadata, index, mirror)
+        assets = AssetCache(paths.asset_cache_dir, temp_root=paths.temp_dir)
+        return cls(manager, storage, db, metadata, index, mirror, assets)
 
     # -------------------------------------------------------------- properties
     @property
@@ -111,6 +117,19 @@ class EasyOfficeCore:
     def mirror(self) -> MirrorCache:
         return self._mirror
 
+    @property
+    def assets(self) -> AssetCache:
+        return self._assets
+
+    @property
+    def office(self):
+        """Lazily constructed Step 2 office-document pipeline."""
+        if self._office is None:
+            from easy_office.parsing.pipeline import OfficeDocumentPipeline
+
+            self._office = OfficeDocumentPipeline(self)
+        return self._office
+
     # --------------------------------------------------------------- ingestion
     def register_inplace(self, path: str | Path) -> FileRecord:
         """Register a host file without copying it into the managed workspace.
@@ -124,6 +143,7 @@ class EasyOfficeCore:
         record = self._metadata.register_file(obj)
         if existing is not None and existing.content_hash != obj.content_hash:
             self._index.delete_chunks_for_file(record.file_uid)
+            self._assets.clear(record.file_uid)
         return record
 
     def ingest_upload(
@@ -201,6 +221,7 @@ class EasyOfficeCore:
         if record is None:
             return False
         self._index.delete_chunks_for_file(file_uid)
+        self._assets.clear(file_uid)
         if delete_managed_bytes and record.storage_mode == StorageMode.MANAGED.value:
             try:
                 self._storage.delete(record.uri)
@@ -266,6 +287,11 @@ class EasyOfficeCore:
                 "this build supports only storage.object_store_driver='local'; "
                 f"got {config.storage.object_store_driver!r}"
             )
+        if config.storage.parsing_backend.strip().lower() != "docling":
+            raise ConfigError(
+                "this build supports only storage.parsing_backend='docling'; "
+                f"got {config.storage.parsing_backend!r}"
+            )
 
     def _validate_config_change(self, old: AppConfig, new: AppConfig) -> None:
         self._assert_supported(new)
@@ -293,4 +319,8 @@ class EasyOfficeCore:
         self._mirror.reconfigure(
             root=paths.mirror_dir,
             enabled=new.storage.mirror_enabled,
+        )
+        self._assets.reconfigure(
+            root=paths.asset_cache_dir,
+            temp_root=paths.temp_dir,
         )

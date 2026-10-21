@@ -88,6 +88,24 @@ class LocalParserConfig(_StrictModel):
     ocr_engine: str = "rapidocr"
     ocr_languages: list[str] = Field(default_factory=lambda: ["ch_sim", "en"])
     ocr_enabled: bool = True
+    # Step 2: formula enrichment is a CPU-heavy VLM. It runs only on the
+    # scanned-page route; digital pages use native-text formula signals.
+    formula_enrichment: bool = True
+    libreoffice_path: str = ""
+    # Page-level digital/scanned routing thresholds.
+    scanned_page_dpi: int = Field(default=200, ge=72, le=600)
+    digital_text_min_chars: int = Field(default=30, ge=0, le=10000)
+    scan_image_area_ratio: float = Field(default=0.6, ge=0.0, le=1.0)
+    # Deterministic decorative-image filters.
+    image_min_side_px: int = Field(default=64, ge=1, le=10000)
+    image_min_area_px: int = Field(default=12000, ge=1, le=100_000_000)
+    image_max_aspect_ratio: float = Field(default=12.0, gt=0.0, le=1000.0)
+    # A raster that covers most of a page is the page scan/background, not a
+    # substantive embedded figure. Scanned pages use a lower threshold because
+    # Docling reports the scan region rather than the full page rectangle.
+    image_max_page_coverage: float = Field(default=0.85, ge=0.0, le=1.0)
+    scanned_page_image_coverage: float = Field(default=0.4, ge=0.0, le=1.0)
+    max_chunk_chars: int = Field(default=1000, ge=100, le=20000)
 
     @field_validator("weights_dir", "layout_model", "table_model", "ocr_engine")
     @classmethod
@@ -95,6 +113,14 @@ class LocalParserConfig(_StrictModel):
         text = value.strip()
         if not text:
             raise ValueError("value must not be empty")
+        if "\x00" in text:
+            raise ValueError("value must not contain NUL characters")
+        return text
+
+    @field_validator("libreoffice_path")
+    @classmethod
+    def _validate_optional_path(cls, value: str) -> str:
+        text = value.strip()
         if "\x00" in text:
             raise ValueError("value must not contain NUL characters")
         return text
@@ -113,9 +139,14 @@ class StorageConfig(_StrictModel):
 
     host_watch_dirs: list[str] = Field(default_factory=list)
     host_allowed_roots: list[str] = Field(default_factory=list)
-    managed_workspace: str = "managed"
-    index_db_path: str = "index/knowledge.db"
+    # Durable service-owned upload store, relative to the config/project root.
+    managed_workspace: str = "managed_src_files"
+    # Rebuildable runtime state, relative to the runtime directory.
+    index_db_path: str = "knowledge.db"
     mirror_cache_dir: str = "mirror"
+    # Cropped document images and generated render assets.
+    asset_cache_dir: str = "assets"
+    temp_dir: str = "tmp"
     parsing_backend: str = "docling"
     vector_store_driver: str = "sqlite"
     object_store_driver: str = "local"
@@ -126,6 +157,8 @@ class StorageConfig(_StrictModel):
         "managed_workspace",
         "index_db_path",
         "mirror_cache_dir",
+        "asset_cache_dir",
+        "temp_dir",
         "parsing_backend",
         "vector_store_driver",
         "object_store_driver",

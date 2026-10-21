@@ -47,13 +47,20 @@ class ConfigValidationError(ConfigError):
 
 @dataclass(frozen=True)
 class ResolvedPaths:
-    """Absolute paths derived from the current configuration."""
+    """Absolute paths derived from the current configuration.
+
+    ``config_root`` is the project/config directory (config, models, managed
+    source files, user watch roots); ``data_dir`` is the rebuildable runtime
+    root (database, mirror, assets, temp).
+    """
 
     data_dir: Path
     config_path: Path
     managed_workspace: Path
     index_db_path: Path
     mirror_dir: Path
+    asset_cache_dir: Path
+    temp_dir: Path
     weights_dir: Path
     host_watch_dirs: tuple[Path, ...]
     host_allowed_roots: tuple[Path, ...]
@@ -71,11 +78,22 @@ class ConnectivityResult:
         return asdict(self)
 
 
-def _default_data_dir() -> Path:
-    env_home = os.environ.get("EASYOFFICE_HOME")
-    if env_home:
-        return Path(env_home).expanduser().resolve(strict=False)
-    return Path(__file__).resolve().parents[2] / "data"
+def _default_project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _default_config_path(project_root: Path) -> Path:
+    env_config = os.environ.get("EASYOFFICE_CONFIG")
+    if env_config:
+        return Path(os.path.expandvars(env_config)).expanduser().resolve(strict=False)
+    return project_root / "config.yaml"
+
+
+def _default_runtime_dir(project_root: Path) -> Path:
+    env_runtime = os.environ.get("EASYOFFICE_RUNTIME") or os.environ.get("EASYOFFICE_HOME")
+    if env_runtime:
+        return Path(os.path.expandvars(env_runtime)).expanduser().resolve(strict=False)
+    return project_root / "runtime"
 
 
 def _format_validation_error(exc: ValidationError) -> list[str]:
@@ -146,26 +164,29 @@ class ConfigManager:
         config_path: str | Path | None = None,
         data_dir: str | Path | None = None,
         *,
+        project_root: str | Path | None = None,
         create_if_missing: bool = True,
     ) -> None:
-        if config_path is None and data_dir is None:
-            data_dir = _default_data_dir()
-
-        if config_path is not None:
-            resolved_config = Path(os.path.expandvars(os.fspath(config_path))).expanduser()
-            resolved_config = resolved_config.resolve(strict=False)
-            if data_dir is None:
-                data_dir = resolved_config.parent
+        root = (
+            Path(os.path.expandvars(os.fspath(project_root))).expanduser().resolve(strict=False)
+            if project_root is not None
+            else _default_project_root()
+        )
+        if config_path is None:
+            resolved_config = _default_config_path(root)
         else:
-            resolved_config = None
+            resolved_config = Path(
+                os.path.expandvars(os.fspath(config_path))
+            ).expanduser().resolve(strict=False)
 
-        resolved_data = Path(os.path.expandvars(os.fspath(data_dir))).expanduser()
-        resolved_data = resolved_data.resolve(strict=False)
-
-        if resolved_config is None:
-            resolved_config = resolved_data / "config.yaml"
+        resolved_data = (
+            Path(os.path.expandvars(os.fspath(data_dir))).expanduser().resolve(strict=False)
+            if data_dir is not None
+            else _default_runtime_dir(root)
+        )
 
         self._lock = threading.RLock()
+        self._project_root = root
         self._data_dir = resolved_data
         self._config_path = resolved_config
         self._listeners: list[Listener] = []
@@ -186,12 +207,29 @@ class ConfigManager:
     def config_path(self) -> Path:
         return self._config_path
 
-    def resolve_path(self, value: str | Path) -> Path:
+    @property
+    def project_root(self) -> Path:
+        return self._project_root
+
+    def resolve_runtime_path(self, value: str | Path) -> Path:
+        """Resolve a path relative to the rebuildable runtime directory."""
         text = os.path.expandvars(os.fspath(value))
         candidate = Path(text).expanduser()
         if not candidate.is_absolute():
             candidate = self._data_dir / candidate
         return candidate.resolve(strict=False)
+
+    def resolve_project_path(self, value: str | Path) -> Path:
+        """Resolve a path relative to the configuration/project directory."""
+        text = os.path.expandvars(os.fspath(value))
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute():
+            candidate = self._config_path.parent / candidate
+        return candidate.resolve(strict=False)
+
+    def resolve_path(self, value: str | Path) -> Path:
+        """Backward-compatible alias for runtime-relative resolution."""
+        return self.resolve_runtime_path(value)
 
     def paths(self) -> ResolvedPaths:
         with self._lock:
@@ -199,15 +237,17 @@ class ConfigManager:
         return ResolvedPaths(
             data_dir=self._data_dir,
             config_path=self._config_path,
-            managed_workspace=self.resolve_path(config.storage.managed_workspace),
-            index_db_path=self.resolve_path(config.storage.index_db_path),
-            mirror_dir=self.resolve_path(config.storage.mirror_cache_dir),
-            weights_dir=self.resolve_path(config.local_parser.weights_dir),
+            managed_workspace=self.resolve_project_path(config.storage.managed_workspace),
+            index_db_path=self.resolve_runtime_path(config.storage.index_db_path),
+            mirror_dir=self.resolve_runtime_path(config.storage.mirror_cache_dir),
+            asset_cache_dir=self.resolve_runtime_path(config.storage.asset_cache_dir),
+            temp_dir=self.resolve_runtime_path(config.storage.temp_dir),
+            weights_dir=self.resolve_project_path(config.local_parser.weights_dir),
             host_watch_dirs=tuple(
-                self.resolve_path(item) for item in config.storage.host_watch_dirs
+                self.resolve_project_path(item) for item in config.storage.host_watch_dirs
             ),
             host_allowed_roots=tuple(
-                self.resolve_path(item) for item in config.storage.host_allowed_roots
+                self.resolve_project_path(item) for item in config.storage.host_allowed_roots
             ),
         )
 
@@ -216,6 +256,8 @@ class ConfigManager:
         paths.managed_workspace.mkdir(parents=True, exist_ok=True)
         paths.index_db_path.parent.mkdir(parents=True, exist_ok=True)
         paths.mirror_dir.mkdir(parents=True, exist_ok=True)
+        paths.asset_cache_dir.mkdir(parents=True, exist_ok=True)
+        paths.temp_dir.mkdir(parents=True, exist_ok=True)
         paths.weights_dir.mkdir(parents=True, exist_ok=True)
         return paths
 
@@ -407,7 +449,7 @@ class ConfigManager:
 
     def _probe_local_parser(self, config: AppConfig) -> ConnectivityResult:
         started = time.monotonic()
-        weights = self.resolve_path(config.local_parser.weights_dir)
+        weights = self.resolve_project_path(config.local_parser.weights_dir)
         present = self._weights_present(weights)
         elapsed = (time.monotonic() - started) * 1000.0
         detail = {
@@ -438,7 +480,7 @@ class ConfigManager:
         if provider == ServiceMode.DISABLED or (name == "reranker" and not service.enabled):
             return ConnectivityResult(name, "disabled", "service is disabled")
         if provider == ServiceMode.LOCAL:
-            weights = self.resolve_path(config.local_parser.weights_dir)
+            weights = self.resolve_project_path(config.local_parser.weights_dir)
             present = self._weights_present(weights)
             status = "ok" if present else "not_configured"
             message = (

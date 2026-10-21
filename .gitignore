@@ -10,7 +10,12 @@ wheels/
 .venv
 
 # Runtime data and test caches
-data/
+/data/
+/config.yaml
+.env
+/models/
+/managed_src_files/
+/runtime/
 .pytest_cache/
 *.db-wal
 *.db-shm
@@ -18,3 +23,5 @@ data/
 *.sqlite-shm
 
 .claude
+/docs/devplan.md
+.vscode

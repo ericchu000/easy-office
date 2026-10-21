@@ -5,8 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "docling[rapidocr]>=2.140.0",
     "jieba>=0.42.1",
     "pydantic>=2.7",
+    "pymupdf>=2.0",
     "pytest>=8.0",
     "pyyaml>=6.0",
     "sqlite-vec>=0.1.6",
